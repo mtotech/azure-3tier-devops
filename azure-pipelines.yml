@@ -415,6 +415,8 @@ stages:
 
     steps:
 
+
+
     - task: AzureCLI@2
       displayName: Validate Public Application
       inputs:
@@ -426,23 +428,17 @@ stages:
 
           RG="$(resourceGroup)"
 
-          APPGW_NAME=$(az network application-gateway list \
+          PUBLIC_IP=$(az network public-ip list \
             --resource-group "$RG" \
-            --query "[0].name" \
-            -o tsv)
-
-          PUBLIC_IP_ID=$(az network application-gateway show \
-            --resource-group "$RG" \
-            --name "$APPGW_NAME" \
-            --query "frontendIpConfigurations[0].publicIPAddress.id" \
-            -o tsv)
-
-          PUBLIC_IP=$(az network public-ip show \
-            --ids "$PUBLIC_IP_ID" \
-            --query ipAddress \
+            --query "[?contains(name,'frontend')].ipAddress | [0]" \
             -o tsv)
 
           echo "Public Application IP: $PUBLIC_IP"
+
+          if [ -z "$PUBLIC_IP" ]; then
+            echo "ERROR: Application Gateway public IP could not be found."
+            exit 1
+          fi
 
           echo "Waiting for Application Gateway health..."
           sleep 30
@@ -460,5 +456,6 @@ stages:
             --retry 6 \
             --retry-delay 10 \
             "http://$PUBLIC_IP/api/goals"
-
           echo "Application deployment validated successfully."
+           
+      
