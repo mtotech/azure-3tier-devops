@@ -89,7 +89,9 @@ fi
 
 echo "Running Docker container with backend URL: http://${backend_lb_ip}:8080"
 # Frontend container with properly configured backend URL
-docker run -d -p "${application_port}:${application_port}" \
+docker run -d \
+  --name goaltracker-frontend \
+  -p "${application_port}:${application_port}" \
   -e PORT="${application_port}" \
   -e BACKEND_URL="http://${backend_lb_ip}:8080" \
   --restart always \

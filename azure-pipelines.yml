@@ -6,6 +6,7 @@ trigger:
     include:
       - backend/*
       - frontend/*
+      - infra/modules/compute/scripts/*
       - azure-pipelines.yml
 
 variables:
@@ -18,64 +19,82 @@ pool:
 
 stages:
 
-# ---------------- TEST ----------------
+# =========================================================
+# STAGE 1 - TEST
+# =========================================================
 - stage: Test
   displayName: Test Application
 
   jobs:
+
   - job: BackendTest
-    displayName: Backend Test
+    displayName: Backend Go Test
+
     steps:
+
     - checkout: self
 
     - task: GoTool@0
+      displayName: Install Go
       inputs:
         version: '1.23'
 
     - script: |
+        set -e
         cd backend
         go mod download
         go test ./...
-      displayName: Go Test
+      displayName: Run Backend Tests
+
 
   - job: FrontendTest
     displayName: Frontend Test
+
     steps:
+
     - checkout: self
 
     - task: NodeTool@0
+      displayName: Install Node.js
       inputs:
         versionSpec: '18.x'
 
     - script: |
+        set -e
         cd frontend
         npm ci
-        npm test --if-present
-      displayName: NPM Test
+        npm test
+      displayName: Run Frontend Tests
 
 
-# ------------- BUILD + PUSH -------------
+# =========================================================
+# STAGE 2 - BUILD AND PUSH TO ACR
+# =========================================================
 - stage: BuildPush
-  displayName: Build and Push to ACR
+  displayName: Build and Push Images
   dependsOn: Test
   condition: succeeded()
 
   jobs:
+
   - job: BuildImages
     displayName: Docker Build and Push
 
     steps:
+
     - checkout: self
 
     - task: AzureCLI@2
-      displayName: ACR Login
+      displayName: Login to Azure Container Registry
       inputs:
         azureSubscription: '$(azureServiceConnection)'
         scriptType: bash
         scriptLocation: inlineScript
         inlineScript: |
+          set -e
+
           ACR_NAME=$(az acr list \
-            --resource-group $(resourceGroup) \
+            --resource-group "$(resourceGroup)" \
             --query "[0].name" \
             -o tsv)
 
@@ -84,7 +103,8 @@ stages:
             --query loginServer \
             -o tsv)
 
-          echo "ACR: $ACR_SERVER"
+          echo "ACR Name: $ACR_NAME"
+          echo "ACR Server: $ACR_SERVER"
 
           echo "##vso[task.setvariable variable=ACR_NAME]$ACR_NAME"
           echo "##vso[task.setvariable variable=ACR_SERVER]$ACR_SERVER"
@@ -92,6 +112,8 @@ stages:
           az acr login --name "$ACR_NAME"
 
     - script: |
+        set -e
+
         docker build \
           -t $(ACR_SERVER)/backend:$(imageTag) \
           -t $(ACR_SERVER)/backend:latest \
@@ -104,9 +126,339 @@ stages:
       displayName: Build Docker Images
 
     - script: |
+        set -e
+
         docker push $(ACR_SERVER)/backend:$(imageTag)
         docker push $(ACR_SERVER)/backend:latest
 
         docker push $(ACR_SERVER)/frontend:$(imageTag)
         docker push $(ACR_SERVER)/frontend:latest
       displayName: Push Images to ACR
+
+
+# =========================================================
+# STAGE 3 - DEPLOY BACKEND VMSS
+# =========================================================
+- stage: DeployBackend
+  displayName: Deploy Backend VMSS
+  dependsOn: BuildPush
+  condition: succeeded()
+
+  jobs:
+
+  - job: BackendDeploy
+    displayName: Deploy Backend Build
+
+    steps:
+
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: Deploy Backend Image
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+
+          RG="$(resourceGroup)"
+
+          ACR_NAME=$(az acr list \
+            --resource-group "$RG" \
+            --query "[0].name" \
+            -o tsv)
+
+          ACR_SERVER=$(az acr show \
+            --name "$ACR_NAME" \
+            --query loginServer \
+            -o tsv)
+
+          BACKEND_VMSS=$(az vmss list \
+            --resource-group "$RG" \
+            --query "[?contains(name,'backend')].name | [0]" \
+            -o tsv)
+
+          BACKEND_IDENTITY=$(az identity list \
+            --resource-group "$RG" \
+            --query "[?contains(name,'backend')].clientId | [0]" \
+            -o tsv)
+
+          KEYVAULT_NAME=$(az keyvault list \
+            --resource-group "$RG" \
+            --query "[0].name" \
+            -o tsv)
+
+          IMAGE="$ACR_SERVER/backend:$(Build.BuildId)"
+
+          echo "Backend VMSS: $BACKEND_VMSS"
+          echo "Backend Image: $IMAGE"
+
+          INSTANCE_IDS=$(az vmss list-instances \
+            --resource-group "$RG" \
+            --name "$BACKEND_VMSS" \
+            --query "[].instanceId" \
+            -o tsv)
+
+          for INSTANCE_ID in $INSTANCE_IDS
+          do
+            echo "Deploying backend instance: $INSTANCE_ID"
+
+            az vmss run-command invoke \
+              --resource-group "$RG" \
+              --name "$BACKEND_VMSS" \
+              --instance-id "$INSTANCE_ID" \
+              --command-id RunShellScript \
+              --scripts "
+                set -e
+
+                az login \
+                  --identity \
+                  --client-id '$BACKEND_IDENTITY' \
+                  --allow-no-subscriptions >/dev/null
+
+                az acr login --name '$ACR_NAME'
+
+                docker pull '$IMAGE'
+
+                DB_USERNAME=\$(az keyvault secret show \
+                  --vault-name '$KEYVAULT_NAME' \
+                  --name db-username \
+                  --query value \
+                  -o tsv)
+
+                DB_PASSWORD=\$(az keyvault secret show \
+                  --vault-name '$KEYVAULT_NAME' \
+                  --name db-password \
+                  --query value \
+                  -o tsv)
+
+                DB_HOST=\$(az keyvault secret show \
+                  --vault-name '$KEYVAULT_NAME' \
+                  --name db-host \
+                  --query value \
+                  -o tsv)
+
+                DB_NAME=\$(az keyvault secret show \
+                  --vault-name '$KEYVAULT_NAME' \
+                  --name db-name \
+                  --query value \
+                  -o tsv)
+
+                DB_PORT=\$(az keyvault secret show \
+                  --vault-name '$KEYVAULT_NAME' \
+                  --name db-port \
+                  --query value \
+                  -o tsv)
+
+                SSL_MODE=\$(az keyvault secret show \
+                  --vault-name '$KEYVAULT_NAME' \
+                  --name db-sslmode \
+                  --query value \
+                  -o tsv)
+
+                docker rm -f goaltracker-backend 2>/dev/null || true
+
+                docker ps -q \
+                  --filter publish=8080 \
+                  | xargs -r docker rm -f
+
+                docker run -d \
+                  --name goaltracker-backend \
+                  -p 8080:8080 \
+                  -e DB_USERNAME=\"\$DB_USERNAME\" \
+                  -e DB_PASSWORD=\"\$DB_PASSWORD\" \
+                  -e DB_HOST=\"\$DB_HOST\" \
+                  -e DB_PORT=\"\$DB_PORT\" \
+                  -e DB_NAME=\"\$DB_NAME\" \
+                  -e SSL=\"\$SSL_MODE\" \
+                  -e PORT=8080 \
+                  --restart always \
+                  '$IMAGE'
+
+                sleep 10
+
+                curl --fail http://localhost:8080/health
+              "
+
+            echo "Backend instance $INSTANCE_ID successfully deployed"
+          done
+
+
+# =========================================================
+# STAGE 4 - DEPLOY FRONTEND VMSS
+# =========================================================
+- stage: DeployFrontend
+  displayName: Deploy Frontend VMSS
+  dependsOn: DeployBackend
+  condition: succeeded()
+
+  jobs:
+
+  - job: FrontendDeploy
+    displayName: Deploy Frontend Build
+
+    steps:
+
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: Deploy Frontend Image
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+
+          RG="$(resourceGroup)"
+
+          ACR_NAME=$(az acr list \
+            --resource-group "$RG" \
+            --query "[0].name" \
+            -o tsv)
+
+          ACR_SERVER=$(az acr show \
+            --name "$ACR_NAME" \
+            --query loginServer \
+            -o tsv)
+
+          FRONTEND_VMSS=$(az vmss list \
+            --resource-group "$RG" \
+            --query "[?contains(name,'frontend')].name | [0]" \
+            -o tsv)
+
+          FRONTEND_IDENTITY=$(az identity list \
+            --resource-group "$RG" \
+            --query "[?contains(name,'frontend')].clientId | [0]" \
+            -o tsv)
+
+          BACKEND_LB=$(az network lb list \
+            --resource-group "$RG" \
+            --query "[?contains(name,'backend')].name | [0]" \
+            -o tsv)
+
+          BACKEND_IP=$(az network lb frontend-ip list \
+            --resource-group "$RG" \
+            --lb-name "$BACKEND_LB" \
+            --query "[0].privateIPAddress" \
+            -o tsv)
+
+          IMAGE="$ACR_SERVER/frontend:$(Build.BuildId)"
+
+          echo "Frontend VMSS: $FRONTEND_VMSS"
+          echo "Frontend Image: $IMAGE"
+          echo "Backend URL: http://$BACKEND_IP:8080"
+
+          INSTANCE_IDS=$(az vmss list-instances \
+            --resource-group "$RG" \
+            --name "$FRONTEND_VMSS" \
+            --query "[].instanceId" \
+            -o tsv)
+
+          for INSTANCE_ID in $INSTANCE_IDS
+          do
+            echo "Deploying frontend instance: $INSTANCE_ID"
+
+            az vmss run-command invoke \
+              --resource-group "$RG" \
+              --name "$FRONTEND_VMSS" \
+              --instance-id "$INSTANCE_ID" \
+              --command-id RunShellScript \
+              --scripts "
+                set -e
+
+                az login \
+                  --identity \
+                  --client-id '$FRONTEND_IDENTITY' \
+                  --allow-no-subscriptions >/dev/null
+
+                az acr login --name '$ACR_NAME'
+
+                docker pull '$IMAGE'
+
+                docker rm -f goaltracker-frontend 2>/dev/null || true
+
+                docker ps -q \
+                  --filter publish=3000 \
+                  | xargs -r docker rm -f
+
+                docker run -d \
+                  --name goaltracker-frontend \
+                  -p 3000:3000 \
+                  -e PORT=3000 \
+                  -e BACKEND_URL='http://$BACKEND_IP:8080' \
+                  --restart always \
+                  '$IMAGE'
+
+                sleep 10
+
+                curl --fail http://localhost:3000/
+              "
+
+            echo "Frontend instance $INSTANCE_ID successfully deployed"
+          done
+
+
+# =========================================================
+# STAGE 5 - POST DEPLOYMENT VALIDATION
+# =========================================================
+- stage: Validate
+  displayName: Validate Deployment
+  dependsOn: DeployFrontend
+  condition: succeeded()
+
+  jobs:
+
+  - job: HealthCheck
+    displayName: Application Health Check
+
+    steps:
+
+    - task: AzureCLI@2
+      displayName: Validate Public Application
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+
+          RG="$(resourceGroup)"
+
+          APPGW_NAME=$(az network application-gateway list \
+            --resource-group "$RG" \
+            --query "[0].name" \
+            -o tsv)
+
+          PUBLIC_IP_ID=$(az network application-gateway show \
+            --resource-group "$RG" \
+            --name "$APPGW_NAME" \
+            --query "frontendIpConfigurations[0].publicIPAddress.id" \
+            -o tsv)
+
+          PUBLIC_IP=$(az network public-ip show \
+            --ids "$PUBLIC_IP_ID" \
+            --query ipAddress \
+            -o tsv)
+
+          echo "Public Application IP: $PUBLIC_IP"
+
+          echo "Waiting for Application Gateway health..."
+          sleep 30
+
+          echo "Checking frontend..."
+          curl \
+            --fail \
+            --retry 6 \
+            --retry-delay 10 \
+            "http://$PUBLIC_IP/"
+
+          echo "Checking API..."
+          curl \
+            --fail \
+            --retry 6 \
+            --retry-delay 10 \
+            "http://$PUBLIC_IP/api/goals"
+
+          echo "Application deployment validated successfully."

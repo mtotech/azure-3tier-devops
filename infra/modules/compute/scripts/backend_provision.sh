@@ -136,7 +136,9 @@ fi
 
 # Backend container needs DB environment variables
 echo "Running Docker container..."
-docker run -d -p "$application_port:$application_port" \
+docker run -d \
+  --name goaltracker-backend \
+  -p "$application_port:$application_port" \
   -e DB_USERNAME="$DB_USERNAME" \
   -e DB_PASSWORD="$DB_PASSWORD" \
   -e DB_HOST="$DB_HOST" \
