@@ -1,0 +1,112 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - backend/*
+      - frontend/*
+      - azure-pipelines.yml
+
+variables:
+  azureServiceConnection: 'azure-3tier-service-connection'
+  resourceGroup: 'three-tier-app-prod'
+  imageTag: '$(Build.BuildId)'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+
+# ---------------- TEST ----------------
+- stage: Test
+  displayName: Test Application
+
+  jobs:
+  - job: BackendTest
+    displayName: Backend Test
+    steps:
+    - checkout: self
+
+    - task: GoTool@0
+      inputs:
+        version: '1.23'
+
+    - script: |
+        cd backend
+        go mod download
+        go test ./...
+      displayName: Go Test
+
+  - job: FrontendTest
+    displayName: Frontend Test
+    steps:
+    - checkout: self
+
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+
+    - script: |
+        cd frontend
+        npm ci
+        npm test --if-present
+      displayName: NPM Test
+
+
+# ------------- BUILD + PUSH -------------
+- stage: BuildPush
+  displayName: Build and Push to ACR
+  dependsOn: Test
+  condition: succeeded()
+
+  jobs:
+  - job: BuildImages
+    displayName: Docker Build and Push
+
+    steps:
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: ACR Login
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          ACR_NAME=$(az acr list \
+            --resource-group $(resourceGroup) \
+            --query "[0].name" \
+            -o tsv)
+
+          ACR_SERVER=$(az acr show \
+            --name "$ACR_NAME" \
+            --query loginServer \
+            -o tsv)
+
+          echo "ACR: $ACR_SERVER"
+
+          echo "##vso[task.setvariable variable=ACR_NAME]$ACR_NAME"
+          echo "##vso[task.setvariable variable=ACR_SERVER]$ACR_SERVER"
+
+          az acr login --name "$ACR_NAME"
+
+    - script: |
+        docker build \
+          -t $(ACR_SERVER)/backend:$(imageTag) \
+          -t $(ACR_SERVER)/backend:latest \
+          ./backend
+
+        docker build \
+          -t $(ACR_SERVER)/frontend:$(imageTag) \
+          -t $(ACR_SERVER)/frontend:latest \
+          ./frontend
+      displayName: Build Docker Images
+
+    - script: |
+        docker push $(ACR_SERVER)/backend:$(imageTag)
+        docker push $(ACR_SERVER)/backend:latest
+
+        docker push $(ACR_SERVER)/frontend:$(imageTag)
+        docker push $(ACR_SERVER)/frontend:latest
+      displayName: Push Images to ACR
